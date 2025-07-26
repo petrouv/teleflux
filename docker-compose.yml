@@ -1,0 +1,16 @@
+services:
+  teleflux:
+    image: ghcr.io/petrouv/teleflux:latest
+    container_name: teleflux
+    user: "1000"
+    working_dir: /app
+    command: python -m teleflux
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    networks:
+      - teleflux-net
+
+networks:
+  teleflux-net:
+    driver: bridge

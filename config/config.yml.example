@@ -1,0 +1,33 @@
+telegram:
+  api_id: "YOUR_TELEGRAM_API_ID"
+  api_hash: "YOUR_TELEGRAM_API_HASH"
+  session_file: "data/teleflux.session"   # persistent session file
+  notify_chat_id: "me"                    # "me" for saved messages, "@bot_username" for bots, or numeric chat ID
+
+miniflux:
+  url: "https://your-miniflux-instance.com"
+  token: "YOUR_MINIFLUX_API_TOKEN"
+  # OR use username/password authentication:
+  # username: "YOUR_USERNAME"
+  # password: "YOUR_PASSWORD"
+
+rsshub:
+  base_url: "https://rsshub.app"  # or your custom RSSHub instance
+
+sync:
+  folders:
+    - "AI"
+    - "Tech"
+    - "News"
+    # Add your folder names here
+
+  remove_absent_feeds: true
+  private_feed_mode: "skip"        # secret | skip
+  validate_feeds: true             # true - validate RSS feeds when creating, false - skip validation
+  keep_emojis_in_titles: false     # true - keep emojis in feed titles, false - remove emojis
+  disable_title_updates: false     # true - disable automatic title updates, false - enable title updates
+  notify_no_changes: false         # true - send notifications even when no changes made, false - skip notifications when no changes
+
+logging:
+  level: "INFO"                    # DEBUG | INFO | WARNING | ERROR
+  quiet: false                     # true - only show ERROR and CRITICAL messages (for automated runs), false - use configured level 

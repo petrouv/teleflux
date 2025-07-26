@@ -1,0 +1,43 @@
+# Git and development
+.git
+.gitignore
+
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+teleflux.egg-info/
+
+# Testing and development
+tests/
+.pytest_cache/
+
+# Logs and temporary files  
+*.log
+*.tmp
+tmp/
+output/
+
+# Documentation and assets (not needed in container)
+README.md
+icon.png
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+
+# Session files and data
+*.session
+*.session-journal
+data/
+
+# Configuration (mount at runtime)
+config/config.yml
+
+# Docker files (not needed inside container)
+Dockerfile
+docker-compose.yml
+.dockerignore 
