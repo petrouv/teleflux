@@ -51,6 +51,7 @@ Thumbs.db
 data/
 *.yml
 !docker-compose.yml
+!.github/workflows/*.yml
 config/config.yml
 
 # Testing
