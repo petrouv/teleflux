@@ -419,6 +419,103 @@ class TelefluxSyncer:
         except Exception:
             return f"Category {category_id}"
 
+    def _determine_protected_categories(
+        self,
+        failed_folders: set[str],
+        all_channels: list[TelegramChannel],
+        telegram_feeds: list,
+        category_id_to_name: dict[int, str],
+        channel_assignments: dict[str, tuple[str, str, TelegramChannel]],
+        errors: list[str],
+    ) -> set[str]:
+        """Determine categories that are protected from feed removal due to safety constraints.
+
+        Checks:
+        1. Failed folders: if a folder failed to load from Telegram.
+        2. Empty Folder Guard: if Telegram returned 0 channels for a folder, but Miniflux
+           already has feeds in that category (>= 2 feeds).
+        3. Mass Deletion Guard: if more than 50% of feeds would be removed (> 5 feeds).
+
+        Args:
+            failed_folders: Set of folder names that failed to load.
+            all_channels: All channels successfully retrieved from Telegram.
+            telegram_feeds: All existing Telegram RSS feeds in Miniflux.
+            category_id_to_name: Mapping of category ID to category title.
+            channel_assignments: Channel assignment plan.
+            errors: List of sync errors to append safety warnings to.
+
+        Returns:
+            Set of category names protected from feed deletion.
+        """
+        protected_categories = set()
+
+        # 1. Protect categories whose Telegram folders failed to load
+        for folder_name in failed_folders:
+            cat_name = self.config.sync.folders.get(folder_name)
+            if cat_name:
+                protected_categories.add(cat_name)
+                logger.warning(
+                    f"Safety guard: Category '{cat_name}' is protected from feed deletion "
+                    f"because folder '{folder_name}' failed to load from Telegram"
+                )
+
+        # 2. Empty Folder Guard: protect categories where Telegram returned 0 channels,
+        # but Miniflux already has existing feeds (>= 2 feeds)
+        for folder_name, cat_name in self.config.sync.folders.items():
+            if cat_name in protected_categories:
+                continue
+            folder_channels = [
+                ch for ch in all_channels if ch.folder_name == folder_name
+            ]
+            existing_in_cat = [
+                f
+                for f in telegram_feeds
+                if category_id_to_name.get(f.category_id) == cat_name
+            ]
+            if len(existing_in_cat) >= 2 and len(folder_channels) == 0:
+                protected_categories.add(cat_name)
+                guard_msg = (
+                    f"Safety guard: Category '{cat_name}' has {len(existing_in_cat)} feeds in Miniflux, "
+                    f"but Telegram returned 0 channels for folder '{folder_name}'. "
+                    f"Skipping deletion to prevent history loss."
+                )
+                logger.warning(guard_msg)
+                errors.append(guard_msg)
+
+        # 3. Mass Deletion Guard: protect against deleting more than 50% of feeds (when > 5 feeds)
+        if self.config.sync.remove_absent_feeds:
+            planned_urls_set = {
+                self._normalize_url_for_comparison(url)
+                for url in channel_assignments.keys()
+            }
+            for folder_name, cat_name in self.config.sync.folders.items():
+                if cat_name in protected_categories:
+                    continue
+                existing_in_cat = [
+                    f
+                    for f in telegram_feeds
+                    if category_id_to_name.get(f.category_id) == cat_name
+                ]
+                removals = [
+                    f
+                    for f in existing_in_cat
+                    if self._normalize_url_for_comparison(f.feed_url)
+                    not in planned_urls_set
+                ]
+                if (
+                    len(existing_in_cat) > 5
+                    and len(removals) > len(existing_in_cat) * 0.5
+                ):
+                    protected_categories.add(cat_name)
+                    guard_msg = (
+                        f"Safety guard: Category '{cat_name}' would lose {len(removals)} of {len(existing_in_cat)} "
+                        f"feeds (>50%). Mass deletion blocked to prevent history loss."
+                    )
+                    logger.warning(guard_msg)
+                    errors.append(guard_msg)
+
+        return protected_categories
+
     def _display_folder_comparison(
         self,
         tg_folder: str,
@@ -429,6 +526,7 @@ class TelefluxSyncer:
         all_existing_feeds: list = None,
         dry_run: bool = False,
         update_titles: bool = False,
+        is_protected: bool = False,
     ) -> None:
         """Display detailed side-by-side comparison of Telegram channels and Miniflux feeds.
 
@@ -663,7 +761,7 @@ class TelefluxSyncer:
         # Add items to remove (Miniflux only, but check if they will be moved from this category)
         for item in miniflux_items:
             if item["url"] not in matched_miniflux_urls:
-                status_text = "[TO REMOVE]"
+                status_text = "[PROTECTED]" if is_protected else "[TO REMOVE]"
 
                 # Check if this feed will be moved to another category instead of being removed
                 if channel_assignments:
@@ -1110,12 +1208,14 @@ class TelefluxSyncer:
         moved_feeds = []
         errors = []
 
+        failed_folders = set()
         try:
             # Get channels from Telegram
             try:
                 async with TelegramClient(self.config.telegram) as tg_client:
                     folder_names = list(self.config.sync.folders.keys())
                     all_channels = await tg_client.get_channels_by_folders(folder_names)
+                    failed_folders = set(getattr(tg_client, "failed_folders", set()))
             except Exception as e:
                 error_msg = f"Failed to get channels from Telegram: {e}"
                 logger.error(error_msg)
@@ -1177,6 +1277,23 @@ class TelefluxSyncer:
             # Create category ID to name mapping for fast lookup
             category_id_to_name = {cat.id: cat.title for cat in all_categories}
 
+            # Filter telegram feeds from already obtained feeds
+            telegram_feeds = [
+                feed
+                for feed in all_existing_feeds
+                if self._is_telegram_feed(feed.feed_url)
+            ]
+
+            # Determine protected categories to prevent data loss
+            protected_categories = self._determine_protected_categories(
+                failed_folders=failed_folders,
+                all_channels=all_channels,
+                telegram_feeds=telegram_feeds,
+                category_id_to_name=category_id_to_name,
+                channel_assignments=channel_assignments,
+                errors=errors,
+            )
+
             # Display comparison for each configured folder
             for folder_name, category_name in self.config.sync.folders.items():
                 # Get channels for this folder
@@ -1201,14 +1318,10 @@ class TelefluxSyncer:
                     all_existing_feeds=all_existing_feeds,
                     dry_run=dry_run,
                     update_titles=should_update_titles,
+                    is_protected=category_name in protected_categories,
                 )
 
             # Early optimization: check if any changes are needed
-            telegram_feeds = [
-                feed
-                for feed in all_existing_feeds
-                if self._is_telegram_feed(feed.feed_url)
-            ]
             existing_feed_by_url = {
                 self._normalize_url_for_comparison(feed.feed_url): feed
                 for feed in telegram_feeds
@@ -1267,6 +1380,9 @@ class TelefluxSyncer:
                 }
 
                 for feed in telegram_feeds:
+                    feed_cat_name = category_id_to_name.get(feed.category_id)
+                    if feed_cat_name in protected_categories:
+                        continue
                     if feed.category_id in configured_category_ids:
                         normalized_feed_url = self._normalize_url_for_comparison(
                             feed.feed_url
@@ -1460,6 +1576,13 @@ class TelefluxSyncer:
                     for feed in telegram_feeds:
                         # Only consider feeds that are in categories configured for synchronization
                         if feed.category_id not in configured_category_ids:
+                            continue
+
+                        feed_cat_name = category_id_to_name.get(feed.category_id)
+                        if feed_cat_name in protected_categories:
+                            logger.debug(
+                                f"Skipping removal of feed '{feed.title}': category '{feed_cat_name}' is protected"
+                            )
                             continue
 
                         normalized_feed_url = self._normalize_url_for_comparison(

@@ -112,6 +112,18 @@ class TelegramAPIHandler:
                     logger.error(error_msg)
                     raise TelegramAPIError(error_msg, e, method_name)
 
+            except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 1.0 * (attempt + 1)
+                    logger.warning(
+                        f"Transient network error in {method_name}: {e}. Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    error_msg = f"Network error after {max_retries} attempts in {method_name}: {e}"
+                    logger.error(error_msg)
+                    raise TelegramAPIError(error_msg, e, method_name)
+
             except RPCError as e:
                 error_msg = f"RPC error in {method_name}: {e.MESSAGE} (code: {e.CODE})"
                 logger.error(error_msg)
@@ -208,6 +220,7 @@ class TelegramClient:
         """
         self.config = config
         self.client: Client | None = None
+        self.failed_folders: set[str] = set()
 
     async def __aenter__(self):
         """Async context manager - enter"""
@@ -446,14 +459,19 @@ class TelegramClient:
                     # Check if it's a regular dialog filter or chatlist (skip default)
                     class_name = filter_obj.__class__.__name__
 
-                    # Skip default filters (All Chats, Unread, etc.)
-                    if class_name in ["DialogFilterDefault", "DialogFilterChatlist"]:
+                    # Skip default and suggested filters (All Chats, Unread, etc.)
+                    if class_name in ["DialogFilterDefault", "DialogFilterSuggested"]:
                         logger.debug(f"[SKIP] Skipping default filter: {class_name}")
                         continue
 
                     if hasattr(filter_obj, "id") and hasattr(filter_obj, "title"):
                         folder_id = filter_obj.id
-                        folder_title = filter_obj.title
+                        raw_title = filter_obj.title
+                        folder_title = (
+                            raw_title.text
+                            if hasattr(raw_title, "text")
+                            else str(raw_title)
+                        ).strip()
 
                         if class_name in ["DialogFilter", "DialogFilterChatlist"]:
                             folder_info[folder_id] = folder_title
@@ -508,20 +526,46 @@ class TelegramClient:
                 for filter_obj in result:
                     class_name = filter_obj.__class__.__name__
 
-                    # Skip default filters (All Chats, Unread, etc.)
-                    if class_name in ["DialogFilterDefault", "DialogFilterChatlist"]:
+                    # Skip default and suggested filters (All Chats, Unread, etc.)
+                    if class_name in ["DialogFilterDefault", "DialogFilterSuggested"]:
                         logger.debug(f"[SKIP] Skipping default filter: {class_name}")
                         continue
 
                     if hasattr(filter_obj, "id") and hasattr(filter_obj, "title"):
                         folder_id = filter_obj.id
-                        folder_title = filter_obj.title
+                        raw_title = filter_obj.title
+                        folder_title = (
+                            raw_title.text
+                            if hasattr(raw_title, "text")
+                            else str(raw_title)
+                        ).strip()
 
                         if class_name in ["DialogFilter", "DialogFilterChatlist"]:
-                            # Store include_peers directly
+                            # Store include_peers and pinned_peers (pinned chats also belong to folder)
                             include_peers = []
-                            if hasattr(filter_obj, "include_peers"):
-                                include_peers = filter_obj.include_peers
+                            seen_peer_ids = set()
+
+                            def _get_peer_id(p):
+                                return (
+                                    getattr(p, "channel_id", None)
+                                    or getattr(p, "chat_id", None)
+                                    or getattr(p, "user_id", None)
+                                )
+
+                            for source_list in [
+                                getattr(filter_obj, "pinned_peers", None),
+                                getattr(filter_obj, "include_peers", None),
+                            ]:
+                                if not source_list:
+                                    continue
+                                for p in source_list:
+                                    pid = _get_peer_id(p)
+                                    if pid is not None:
+                                        if pid not in seen_peer_ids:
+                                            seen_peer_ids.add(pid)
+                                            include_peers.append(p)
+                                    else:
+                                        include_peers.append(p)
 
                             # Store exclude_peers as well for debugging
                             exclude_peers = []
@@ -537,7 +581,7 @@ class TelegramClient:
                             }
 
                             logger.debug(
-                                f"Folder '{folder_title}' (ID: {folder_id}) has {len(include_peers)} include_peers and {len(exclude_peers)} exclude_peers"
+                                f"Folder '{folder_title}' (ID: {folder_id}) has {len(include_peers)} peers (including pinned) and {len(exclude_peers)} exclude_peers"
                             )
             else:
                 logger.warning("No dialog filters found in Raw API result")
@@ -640,15 +684,20 @@ class TelegramClient:
             logger.info(
                 "Operating in fallback mode - using high-level API for all folders"
             )
+            self.failed_folders.update(folder_names)
             return await self._fallback_get_channels_from_all_dialogs(folder_names)
 
         # Process each folder separately with pagination (Raw API mode)
         for folder_name in folder_names:
-            if folder_name not in folder_info:
+            clean_folder_name = folder_name.strip()
+            # Try exact match or stripped match
+            folder_data = folder_info.get(folder_name) or folder_info.get(clean_folder_name)
+            if not folder_data:
                 logger.warning(f"Folder '{folder_name}' not found")
+                self.failed_folders.add(folder_name)
                 continue
 
-            peers = folder_info[folder_name]["include_peers"]
+            peers = folder_data["include_peers"]
             logger.info(f"Processing folder: '{folder_name}' with {len(peers)} peers")
 
             if not peers:
@@ -727,6 +776,7 @@ class TelegramClient:
                         logger.error(
                             f"Fallback also failed for batch {batch_num + 1}: {fallback_error}"
                         )
+                        self.failed_folders.add(folder_name)
                         # Continue with next batch
                         continue
 
@@ -734,6 +784,7 @@ class TelegramClient:
                     logger.error(
                         f"Unexpected error in batch {batch_num + 1} for folder '{folder_name}': {e}"
                     )
+                    self.failed_folders.add(folder_name)
                     # Continue with next batch instead of failing completely
                     continue
 
@@ -865,11 +916,24 @@ class TelegramClient:
                             break
 
                 if not chat:
-                    missing_chats += 1
-                    logger.debug(
-                        f"Chat not found for peer_id {peer_id} (type: {peer_type})"
-                    )
-                    continue
+                    # Fallback: attempt to fetch individual chat via client
+                    try:
+                        logger.debug(
+                            f"Chat not found in peer dialogs result for peer_id {peer_id}, attempting client.get_chat..."
+                        )
+                        fetched_chat = await self.client.get_chat(peer_id)
+                        if hasattr(fetched_chat, "_raw") and fetched_chat._raw:
+                            chat = fetched_chat._raw
+                    except Exception as fetch_err:
+                        missing_chats += 1
+                        logger.debug(
+                            f"Chat not found for peer_id {peer_id} (type: {peer_type}): {fetch_err}"
+                        )
+                        continue
+
+            if not chat:
+                missing_chats += 1
+                continue
 
             # Check object type using isinstance on raw objects
             from pyrogram.raw.types import Channel, Chat, User
@@ -918,7 +982,13 @@ class TelegramClient:
                     continue
                 elif getattr(chat, "broadcast", False):
                     # This is a broadcast channel - process it
-                    is_private = not hasattr(chat, "username") or chat.username is None
+                    username = getattr(chat, "username", None)
+                    if not username and hasattr(chat, "usernames") and chat.usernames:
+                        for u in chat.usernames:
+                            if getattr(u, "active", False) or getattr(u, "editable", False):
+                                username = getattr(u, "username", None)
+                                break
+                    is_private = not username
 
                     # Generate hash for private channel
                     channel_hash = None
@@ -928,7 +998,7 @@ class TelegramClient:
                     channel = TelegramChannel(
                         id=chat.id,
                         title=chat.title,
-                        username=chat.username,
+                        username=username,
                         is_private=is_private,
                         folder_name=folder_name,
                         channel_hash=channel_hash,

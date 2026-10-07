@@ -23,7 +23,7 @@ Author:
     Nikita Petrov <petrov.nikita@gmail.com>
 
 Version:
-    1.0.0
+    1.0.1
 """
 
 import warnings
@@ -34,5 +34,5 @@ import warnings
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+")
 warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "teleflux"

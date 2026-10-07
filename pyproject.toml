@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "teleflux"
-version = "1.0.0"
+version = "1.0.1"
 description = "Synchronize Telegram channels with Miniflux categories via RssHub"
 authors = [{name = "Nikita Petrov", email = "petrov.nikita@gmail.com"}]
 license = {text = "MIT"}
